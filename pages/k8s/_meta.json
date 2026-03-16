@@ -1,0 +1,12 @@
+{
+  "index": "Overview",
+  "cluster-setup": "Cluster Setup",
+  "workloads": "Workloads",
+  "networking": "Networking",
+  "storage": "Storage",
+  "security": "Security",
+  "operators": "Operators & CRDs",
+  "monitoring": "Monitoring & Observability",
+  "helm": "Helm",
+  "gitops": "GitOps with ArgoCD / Flux"
+}

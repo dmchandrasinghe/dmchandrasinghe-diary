@@ -1,0 +1,10 @@
+{
+  "index": "Overview",
+  "ci-cd": "CI/CD Pipelines",
+  "github-actions": "GitHub Actions",
+  "azure-devops": "Azure DevOps",
+  "scripting": "Scripting (Bash / PowerShell)",
+  "gitops": "GitOps",
+  "task-automation": "Task Automation",
+  "testing": "Automated Testing"
+}

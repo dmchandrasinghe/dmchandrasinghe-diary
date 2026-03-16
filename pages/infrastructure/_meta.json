@@ -1,0 +1,10 @@
+{
+  "index": "Overview",
+  "networking": "Networking",
+  "compute": "Compute",
+  "storage": "Storage",
+  "dns": "DNS & Load Balancing",
+  "security": "Security & IAM",
+  "cloud-providers": "Cloud Providers",
+  "platform-engineering": "Platform Engineering"
+}

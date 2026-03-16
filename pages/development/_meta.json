@@ -1,0 +1,11 @@
+{
+  "index": "Overview",
+  "dotnet": ".NET / C#",
+  "nodejs": "Node.js",
+  "python": "Python",
+  "architecture": "Architecture Patterns",
+  "api-design": "API Design",
+  "containers": "Containerisation",
+  "databases": "Databases",
+  "testing": "Testing Practices"
+}

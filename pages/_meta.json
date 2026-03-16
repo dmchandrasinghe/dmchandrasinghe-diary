@@ -1,15 +1,15 @@
 {
-  "index": "Introduction",
-  "another": "Another Page",
-  "advanced": "Advanced (A Folder)",
+  "index": "Home",
+  "k8s": "☸ Kubernetes (k8s)",
+  "iaac": "📦 IaaC",
+  "infrastructure": "🏗 Infrastructure",
+  "automation": "⚙️ Automation",
+  "migration": "🚀 Migration",
+  "ai": "🤖 AI",
+  "development": "💻 Development",
+  "ev-vehicle": "⚡ EV Vehicle",
   "about": {
     "title": "About",
     "type": "page"
-  },
-  "contact": {
-    "title": "Contact ↗",
-    "type": "page",
-    "href": "https://twitter.com/shuding_",
-    "newWindow": true
   }
 }

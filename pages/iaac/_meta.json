@@ -1,0 +1,10 @@
+{
+  "index": "Overview",
+  "terraform": "Terraform",
+  "bicep": "Bicep",
+  "arm": "ARM Templates",
+  "pulumi": "Pulumi",
+  "cdk": "AWS CDK",
+  "ansible": "Ansible",
+  "best-practices": "Best Practices"
+}

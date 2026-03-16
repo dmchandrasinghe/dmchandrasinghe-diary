@@ -1,0 +1,10 @@
+{
+  "index": "Overview",
+  "cloud-migration": "Cloud Migration",
+  "database-migration": "Database Migration",
+  "app-modernisation": "App Modernisation",
+  "lift-and-shift": "Lift & Shift",
+  "replatforming": "Replatforming",
+  "refactoring": "Refactoring & Rearchitecting",
+  "tools": "Migration Tools"
+}
