@@ -6,5 +6,7 @@
   "dns": "DNS & Load Balancing",
   "security": "Security & IAM",
   "cloud-providers": "Cloud Providers",
-  "platform-engineering": "Platform Engineering"
+  "platform-engineering": "Platform Engineering",
+  "capi-kubernetes-provisioning": "Kubernetes with Cluster API",
+  "packer-ansible-vm-templates": "VM Templates with Packer & Ansible"
 }

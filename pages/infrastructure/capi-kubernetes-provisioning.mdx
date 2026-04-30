@@ -1,0 +1,149 @@
+# Provisioning Kubernetes Clusters with Cluster API on VMware vSphere
+
+Cluster API (CAPI) is a Kubernetes sub-project that brings Kubernetes-native declarative APIs to cluster lifecycle management. Instead of running scripts or using bespoke tooling to provision nodes, you describe the desired state of a cluster in YAML and CAPI controllers reconcile the real world to match. The same GitOps patterns used to manage applications — version-controlled declarations, automated reconciliation, drift correction — apply equally to the clusters themselves.
+
+## The Core Idea
+
+CAPI introduces a set of Custom Resource Definitions (CRDs) that represent infrastructure concepts:
+
+| Resource | What it represents |
+|---|---|
+| `Cluster` | Top-level cluster object — network config, control plane ref, infrastructure ref |
+| `Machine` | A single node instance |
+| `MachineDeployment` | A declarative set of worker Machines (like a Deployment for nodes) |
+| `KubeadmControlPlane` | A managed control plane with rolling updates and etcd management |
+| `VSphereCluster` | vSphere-specific cluster settings (vCenter server, datacenter) |
+| `VSphereMachineTemplate` | VM hardware spec and template reference for vSphere-provisioned nodes |
+
+These resources live on a **management cluster** — a dedicated Kubernetes cluster whose sole job is to run CAPI controllers and own the lifecycle of other clusters. The clusters it provisions are called **workload clusters**.
+
+## Management Cluster vs Workload Clusters
+
+The management cluster is a small, stable cluster. It runs:
+
+- The CAPI core controllers (cluster, machine, machinedeployment reconcilers)
+- Infrastructure provider controllers (e.g., the vSphere provider `cluster-api-provider-vsphere`)
+- Bootstrap provider (e.g., `kubeadm` bootstrap provider that generates cloud-init data)
+- Control-plane provider (manages `KubeadmControlPlane` objects)
+
+When you apply CAPI manifests to the management cluster, its controllers talk to vSphere, provision VMs from your template, inject kubeadm bootstrap scripts via cloud-init, and wait for nodes to join and become healthy. The workload cluster's API server comes up independently — CAPI stores its kubeconfig as a Secret on the management cluster.
+
+```
+Management Cluster
+  ├── CAPI Controllers
+  ├── vSphere Provider
+  └── Workload Cluster Namespaces
+        ├── cluster-dev/    → dev cluster CAPI objects
+        ├── cluster-test/   → test cluster CAPI objects
+        └── cluster-prod/   → production cluster CAPI objects
+```
+
+## vSphere Provider Architecture
+
+The vSphere provider (`cluster-api-provider-vsphere`, CAPV) implements the infrastructure side. When CAPI requests a machine, CAPV:
+
+1. Clones the referenced vSphere template to a new VM
+2. Injects cloud-init configuration through the VMware **guestinfo datasource** (no DHCP-based metadata service needed)
+3. Powers on the VM
+4. Monitors the VM's power state and IP assignment
+5. Marks the Machine as provisioned once the node has registered with the workload cluster's API server
+
+The guestinfo approach is significant for on-premises environments — it avoids the need for a metadata endpoint and works across any vSphere network topology.
+
+### What the Template Must Contain
+
+CAPV's provisioning model requires that the VM template has already been prepared with:
+
+- A cloud-init implementation that reads from VMware guestinfo
+- `containerd` as the container runtime
+- `kubeadm`, `kubelet`, and `kubectl` matching the target Kubernetes version
+- The kernel modules and sysctl settings Kubernetes requires
+
+This is exactly what a Packer + Ansible build (using `kubernetes-sigs/image-builder`) produces. The template and the CAPI manifests are versioned together — when you upgrade Kubernetes, you build a new template and update the `VSphereMachineTemplate` reference.
+
+## Declarative Cluster Definition
+
+A minimal vSphere cluster definition spans several resources. Conceptually, the key pieces are:
+
+**Cluster** — declares the pod and service CIDR ranges and points to an infrastructure object and a control plane object.
+
+**VSphereCluster** — specifies which vCenter server to use and the load balancer IP for the API server.
+
+**KubeadmControlPlane** — declares how many control-plane replicas to run, which `VSphereMachineTemplate` to use for control-plane VMs, and the kubeadm configuration (API server flags, etcd settings, audit policy, etc.).
+
+**MachineDeployment** — declares worker node replicas and references a `VSphereMachineTemplate` for worker VMs. Rolling updates happen here by updating the template reference or machine spec.
+
+**VSphereMachineTemplate** — the hardware profile: vSphere template name, CPU count, memory, disk size, network interface.
+
+All of these are plain Kubernetes YAML, stored in Git, applied to the management cluster. CAPI does the rest.
+
+## GitOps Integration with ArgoCD
+
+A natural pairing is running ArgoCD on the management cluster and pointing it at the Git repository that contains CAPI manifests. This creates a fully GitOps-driven cluster factory:
+
+- Adding a new cluster means creating a new values file and committing it — ArgoCD applies the CAPI objects, CAPI provisions the VMs
+- Scaling workers means updating the `replicas` field — ArgoCD syncs the change, CAPI adds or removes Machines
+- Kubernetes upgrades mean updating the `version` field in `KubeadmControlPlane` and swapping the `VSphereMachineTemplate` reference — CAPI performs a rolling replacement of control-plane nodes, then workers
+
+Using a Helm chart to render CAPI manifests per cluster is a common pattern. A single chart with cluster-specific values files handles the variable parts (cluster name, node count, hardware sizing, IP addresses) while keeping the structure consistent across all clusters.
+
+### Auto-Registering Workload Clusters with ArgoCD
+
+When CAPI provisions a workload cluster it stores the kubeconfig as a Secret on the management cluster. A Kyverno policy can watch for these secrets and automatically generate ArgoCD cluster secrets — meaning newly provisioned clusters are immediately visible to ArgoCD for application deployment, without any manual registration step.
+
+Labels on the ArgoCD cluster secret control which ApplicationSets deploy to that cluster, enabling a label-driven addon system: a cluster with label `monitoring: "true"` gets the monitoring stack deployed automatically by the ApplicationSet that selects on that label.
+
+## Cluster Lifecycle Operations
+
+### Scaling Workers
+
+Update the `replicas` field in the `MachineDeployment`. CAPI provisions or deprovisions VMs accordingly. With machine health checks configured, unhealthy nodes (failed health checks for a defined period) are automatically replaced without operator intervention.
+
+### Kubernetes Version Upgrades
+
+1. Build a new VM template for the target Kubernetes version
+2. Create a new `VSphereMachineTemplate` referencing the new template
+3. Update the `KubeadmControlPlane` to reference the new template and set the new `version`
+4. CAPI performs a rolling replacement of control-plane nodes (one at a time, maintaining quorum)
+5. Update `MachineDeployment` references for workers — rolling replacement follows
+
+The management cluster and workload clusters upgrade independently. The management cluster can run a newer CAPI/provider version while workload clusters are still on older Kubernetes versions, within the supported version skew.
+
+### Machine Health Checks
+
+`MachineHealthCheck` resources define conditions under which CAPI should replace a node — for example, `NotReady` for more than 5 minutes. This provides basic self-healing without external tooling: failed VMs are deleted and re-provisioned from the template automatically.
+
+## Multi-Cluster Topology
+
+In a typical on-premises setup you might have:
+
+- **dev cluster** — development workloads, lower resource specs, rapid iteration
+- **test cluster** — integration and acceptance testing, mirrors production topology
+- **production cluster** — full HA control plane, larger node pool, stricter network policy
+
+All three are defined as CAPI objects on the same management cluster, under different namespaces. The management cluster itself is isolated from workload traffic — it is a control plane only.
+
+## Networking Considerations
+
+CAPI provisions nodes and handles the OS bootstrap, but cluster networking (CNI) is a separate concern. Common choices for vSphere deployments:
+
+- **Cilium** — eBPF-based, strong network policy support, Hubble for observability
+- **Calico** — widely deployed, well-understood BGP mode for on-premises
+- **Flannel** — simple overlay, minimal configuration
+
+CNI installation is typically handled by an ArgoCD ApplicationSet that targets newly provisioned clusters.
+
+## Observability and Day-2 Operations
+
+Once workload clusters are running, the same GitOps machinery manages addon lifecycle:
+
+- **Prometheus + Grafana** for metrics (deployed via ApplicationSet to all labeled clusters)
+- **External Secrets Operator** for syncing secrets from a vault solution into cluster namespaces
+- **cert-manager** for automated TLS certificate provisioning
+- **Sealed Secrets** for storing encrypted secrets in Git safely
+
+CAPI itself exposes metrics and conditions on its resources — cluster health, machine counts, remediation events — which can be scraped from the management cluster to provide a fleet-wide view.
+
+## Summary
+
+Cluster API transforms Kubernetes cluster provisioning from an imperative, script-driven process into a declarative, GitOps-compatible workflow. On vSphere, the CAPV provider integrates tightly with the hypervisor through the guestinfo datasource, enabling reliable cloud-init delivery without a metadata service. Paired with ArgoCD for GitOps, Kyverno for policy and automation, and a Helm-rendered CAPI manifest structure, the result is a cluster factory where adding, scaling, upgrading, and healing clusters are all normal Kubernetes reconciliation operations — auditable, repeatable, and version-controlled.

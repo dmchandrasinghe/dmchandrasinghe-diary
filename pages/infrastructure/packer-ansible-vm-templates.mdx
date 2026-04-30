@@ -1,0 +1,156 @@
+# Building Kubernetes-Ready VM Templates with Packer and Ansible on VMware
+
+Provisioning Kubernetes clusters at scale with tools like Cluster API requires a reliable, repeatable base: a VM template that is pre-loaded with the container runtime, Kubernetes binaries, and the bootstrap tooling CAPI needs at first boot. Doing this manually is error-prone and hard to version. Packer and Ansible together solve this cleanly — Packer automates the VM creation and OS installation lifecycle in vSphere, while Ansible handles opinionated software configuration and hardening inside the VM.
+
+## Why Build Your Own Templates?
+
+Cloud providers publish ready-made node images, but on-premises vSphere environments often require custom templates due to:
+
+- **Air-gapped or restricted networks** — package mirrors, proxy configurations, or custom CA certificates need to be baked in
+- **Internal compliance requirements** — CIS hardening, audit logging, specific kernel parameters
+- **Specific OS choices** — lightweight distributions like VMware Photon OS reduce attack surface and image size compared to general-purpose distros
+- **Version pinning** — each Kubernetes minor version requires specific kubelet/kubeadm/kubectl binaries; templates make this explicit and reproducible
+
+The Kubernetes project maintains the **image-builder** tool (`kubernetes-sigs/image-builder`) which wraps Packer with pre-built configurations for CAPI-compatible templates across multiple OS choices and hypervisors. It is the recommended starting point rather than building from scratch.
+
+## Technology Overview
+
+### Packer
+
+HashiCorp Packer automates the creation of machine images. For vSphere it uses the `vsphere-iso` builder, which:
+
+1. Boots a VM from an ISO (or content library item)
+2. Sends keystrokes to the OS installer to perform an unattended install
+3. Waits for SSH to become available
+4. Hands off to provisioners (shell scripts, Ansible) to configure the OS
+5. Converts the VM to a template (or exports an OVA)
+
+The full build is defined in a JSON or HCL2 template, making it versionable and auditable.
+
+### Ansible
+
+Ansible handles the configuration inside the VM after the OS is installed. The image-builder project ships Ansible roles that cover:
+
+- Installing and configuring `containerd` as the container runtime
+- Installing `kubeadm`, `kubelet`, and `kubectl` from the Kubernetes package repositories
+- Loading required kernel modules (`overlay`, `br_netfilter`)
+- Applying sysctl settings for Kubernetes networking (IP forwarding, bridge-nf-call-iptables)
+- Disabling swap
+- Configuring `cloud-init` with the VMware guestinfo datasource
+- Installing VMware Guest Tools
+- Running OS hardening tasks (optional CIS profiles)
+- Cleaning the image (removing SSH host keys, machine-id, logs) so each cloned VM gets a unique identity
+
+### VMware Photon OS
+
+Photon OS is a minimal Linux distribution purpose-built for VMware environments. Its advantages for Kubernetes node templates include:
+
+- Small footprint — fewer packages means a smaller attack surface and faster clone times
+- Native VMware integration — Guest Tools and guestinfo datasource work reliably out of the box
+- `tdnf` package manager with access to Kubernetes-compatible package repositories
+- Active security patching cadence from VMware/Broadcom
+
+## The Build Pipeline
+
+A typical Packer + Ansible template build follows this flow:
+
+```
+vSphere
+  └── Packer vsphere-iso builder
+        ├── Boot from Photon OS ISO
+        ├── Automated installer (kickstart / ks.cfg injected via HTTP server)
+        ├── OS first boot completes → SSH available
+        └── Ansible provisioner runs image-builder roles
+              ├── System packages & updates
+              ├── containerd runtime install & config
+              ├── kubeadm / kubelet / kubectl install
+              ├── Kernel modules & sysctl
+              ├── cloud-init + guestinfo datasource
+              ├── VMware Guest Tools
+              ├── OS hardening (optional)
+              └── Image cleanup (deduplicate identities)
+  └── Packer converts VM → vSphere Template
+```
+
+The output is a vSphere template in a designated folder, ready to be referenced by `VSphereMachineTemplate` in a CAPI cluster definition.
+
+## Configuration Surface
+
+The build is parameterized through environment variables and optional JSON override files. Key configuration categories:
+
+**vSphere connection**
+- vCenter server address and credentials
+- Target datacenter, datastore, resource pool, and folder
+- Network for the build VM
+
+**OS and Kubernetes versions**
+- ISO URL and checksum (or a content library reference)
+- Target Kubernetes version — this drives which binary versions Ansible installs
+- Container runtime version (containerd)
+
+**VM hardware**
+- CPU, memory, and disk size for the template VM
+- Firmware (BIOS vs EFI — Photon 5 prefers EFI)
+
+**Customizations**
+- Additional OS packages
+- Extra sysctl settings
+- Custom containerd registry mirrors or TLS configurations
+- Ansible extra-vars file for site-specific overrides
+
+## Template Versioning Strategy
+
+A useful convention is to encode both the OS version and Kubernetes version in the template name, for example:
+
+```
+photon5-kube-v1.31.0
+photon5-kube-v1.32.0
+```
+
+This makes it immediately clear which Kubernetes version a given template supports. CAPI cluster definitions reference templates by name, so upgrading a cluster's Kubernetes version is a matter of updating the template reference and triggering a rolling replacement.
+
+Templates should be rebuilt periodically (e.g., monthly) to pull in OS security patches — independent of Kubernetes upgrades. This separates two distinct lifecycle concerns: OS patching and Kubernetes version management.
+
+## Hardening Considerations
+
+Image-builder supports optional CIS benchmark hardening profiles. When enabled, the Ansible roles apply controls such as:
+
+- Restricting SSH access (key-only, no root login)
+- Enabling auditd with relevant rules
+- Setting restrictive file permissions on sensitive paths
+- Disabling unnecessary services and kernel modules
+
+Not all hardening profiles are compatible with every Kubernetes workload — some CIS controls interfere with container networking or privileged pod requirements. Profiles should be validated against workload requirements before being applied to production templates.
+
+## Automation and CI Integration
+
+Template builds are well-suited to a CI pipeline:
+
+- Trigger builds on a schedule (nightly or weekly) or when the Kubernetes version matrix changes
+- Run `packer validate` to catch configuration errors before a build
+- Publish build logs and checksums as pipeline artifacts
+- Notify teams when a new template is available, so cluster definitions can be updated
+
+This turns template management from an ad-hoc manual operation into a continuous, auditable process.
+
+## Relationship to CAPI
+
+Once a template exists in vSphere, it is referenced in the `VSphereMachineTemplate` resource:
+
+```yaml
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: VSphereMachineTemplate
+spec:
+  template:
+    spec:
+      template: photon5-kube-v1.32.0   # the Packer-built template name
+      numCPUs: 8
+      memoryMiB: 32768
+      diskGiB: 128
+```
+
+Every VM that CAPI provisions for that cluster — whether for a new node, a replaced unhealthy node, or a rolling upgrade — is cloned from exactly this template. The uniformity this provides is the foundation of reliable, reproducible cluster operations.
+
+## Summary
+
+Packer and Ansible, anchored by the `kubernetes-sigs/image-builder` project, provide a principled way to produce CAPI-compatible VM templates for vSphere. The approach trades a one-time investment in a build pipeline for significant ongoing benefits: consistent node images, clean version tracking, separation of OS and Kubernetes lifecycles, and a foundation for scalable, self-healing cluster operations on-premises.

@@ -1,0 +1,100 @@
+# Kubernetes Cluster Provisioning with Cluster API on vSphere
+
+Cluster API (CAPI) is a Kubernetes sub-project that brings declarative, Kubernetes-style APIs to cluster lifecycle management. Rather than using scripts or manual processes to provision infrastructure, CAPI treats clusters themselves as Kubernetes resources — you define what you want, and controllers reconcile the actual state toward that goal.
+
+## What is Cluster API?
+
+At its core, CAPI separates concerns into two types of clusters:
+
+- **Management cluster** — a Kubernetes cluster that runs CAPI controllers and manages the lifecycle of other clusters
+- **Workload clusters** — the clusters created and managed by the management cluster
+
+This model enables a single management cluster to own and operate many workload clusters uniformly, using the same GitOps and reconciliation patterns you already use for application workloads.
+
+## Infrastructure Providers
+
+CAPI is provider-agnostic. For on-premises VMware environments, the **Cluster API Provider vSphere (CAPV)** translates CAPI resource definitions into vSphere VM operations. It handles:
+
+- Creating and cloning VMs from pre-built templates
+- Configuring networking (IP allocation, hostnames)
+- Bootstrapping nodes with `kubeadm`
+- Managing control plane HA through `KubeadmControlPlane`
+
+For cloud environments, providers such as AKS (Azure), EKS (AWS), or GKE (GCP) handle the translation in a similar fashion.
+
+## Key Resource Types
+
+CAPI defines a set of CRDs that together describe a complete cluster:
+
+| Resource | Purpose |
+|----------|---------|
+| `Cluster` | Top-level cluster definition — owns the control plane and infrastructure |
+| `VSphereCluster` | vSphere-specific cluster config (vCenter server, datacenter, etc.) |
+| `KubeadmControlPlane` | Manages control plane nodes with kubeadm, handles rolling upgrades |
+| `MachineDeployment` | Declarative worker node group, similar to a Deployment for VMs |
+| `VSphereMachineTemplate` | Template describing the vSphere VM spec (CPU, RAM, disk, network, OVA template) |
+| `KubeadmConfigTemplate` | Bootstrap configuration injected into each machine at first boot |
+
+The relationship mirrors how Kubernetes manages pods: a `MachineDeployment` creates `MachineSets`, which create individual `Machines`, each backed by a `VSphereMachine` that maps 1:1 to a vSphere VM.
+
+## VM Templates: The Foundation
+
+Before any cluster can be provisioned, a VM template must exist in vSphere. This template is a pre-built, CAPI-compatible OS image that includes:
+
+- A supported Linux distribution (e.g., Ubuntu, Photon OS)
+- `containerd` container runtime
+- `kubeadm`, `kubelet`, and `kubectl` binaries for the target Kubernetes version
+- `cloud-init` with the **VMware guestinfo datasource** — this allows CAPI to inject configuration at boot without requiring a DHCP-registered cloud-init endpoint
+- Correct kernel modules and sysctl settings for Kubernetes networking
+- VMware Guest Tools for vSphere integration
+
+These templates are version-pinned — each Kubernetes minor version typically has its own template. When a `VSphereMachineTemplate` references a template, every VM cloned from it will have identical, known-good software versions.
+
+## GitOps-Driven Cluster Management
+
+CAPI integrates naturally with GitOps tooling. A common pattern stores all cluster definitions as YAML in a Git repository, with ArgoCD or Flux reconciling changes from the repository to the management cluster. The workflow looks like:
+
+1. A cluster engineer creates or edits a cluster values/manifest file in Git
+2. The GitOps controller detects the change and applies it to the management cluster
+3. CAPI controllers reconcile — spinning up VMs, bootstrapping nodes, and producing a working `kubeconfig`
+4. A policy engine (e.g., Kyverno) watches for the new kubeconfig secret and automatically registers the cluster with ArgoCD
+5. ArgoCD then deploys all configured add-ons (CNI, ingress, monitoring, etc.) to the new workload cluster
+
+This creates a fully self-service, auditable, and repeatable provisioning pipeline with no manual kubectl commands.
+
+## Cluster Add-ons via ApplicationSets
+
+Once a workload cluster is registered, add-on deployment is driven by labels. Each add-on (CNI, cert-manager, ingress controller, metrics-server, etc.) is packaged as an **ArgoCD ApplicationSet** that targets clusters matching specific label selectors.
+
+When a cluster is registered with labels like `cilium: "true"` or `prometheus-crds: "true"`, the corresponding ApplicationSet automatically deploys that component. This makes add-on management declarative — adding an add-on to a cluster is as simple as adding a label.
+
+## Scaling and Upgrades
+
+### Scaling Workers
+
+Worker node count is controlled by the `replicas` field on `MachineDeployment`. Changing this value in Git triggers a reconciliation that clones new VMs from the same template, bootstraps them, and joins them to the cluster — or drains and deletes excess nodes.
+
+### Kubernetes Version Upgrades
+
+Upgrading Kubernetes involves:
+
+1. Building or obtaining a new VM template for the target Kubernetes version
+2. Updating the `VSphereMachineTemplate` to reference the new template
+3. Updating the `KubeadmControlPlane` version field
+
+CAPI performs a rolling replacement: new control plane nodes are created from the updated template, joined to the cluster, and only after successful health checks are old nodes removed. Worker nodes follow the same rolling pattern through `MachineDeployment`.
+
+## Node Health and Remediation
+
+CAPI supports `MachineHealthChecks`, which monitor node conditions (e.g., `NotReady` for more than a threshold duration). When a node fails a health check, CAPI automatically deletes the unhealthy `Machine` and creates a replacement — providing self-healing infrastructure without manual intervention.
+
+## Considerations
+
+- **Template freshness** — templates should be periodically rebuilt to include OS security patches; this decouples OS patching from Kubernetes upgrades
+- **IP address management** — CAPV supports both DHCP and static IP assignment; for production, static IPs or IPAM integration is recommended to avoid address churn
+- **Control plane HA** — `KubeadmControlPlane` manages etcd clustering automatically, but the control plane VIP/load balancer must be configured separately (e.g., kube-vip or an external LB)
+- **Bootstrap credentials** — initial SSH keys and cloud-init user data are sensitive; use sealed secrets or an external secrets operator to keep them out of Git in plaintext
+
+## Summary
+
+Cluster API turns cluster provisioning from an operational task into a declarative engineering practice. Combined with GitOps tooling, it delivers a consistent, auditable, and scalable approach to managing Kubernetes infrastructure — whether on-premises with vSphere or across cloud providers. The investment in building compliant VM templates and a management cluster pays dividends in repeatability, upgrade safety, and reduced operational toil across a fleet of clusters.
